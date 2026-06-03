@@ -1,6 +1,7 @@
 const std = @import("std");
 const clay = @import("zclay");
 const font = @import("font.zig");
+const image_mod = @import("image.zig");
 const math = std.math;
 
 const num_circle_segments: u32 = 16;
@@ -9,13 +10,18 @@ pub const Vertex = extern struct {
     pos: [2]f32,
     color: [4]f32,
     uv: [2]f32,
+    /// (local_u, local_v, r/width, r/height) — used by image pipeline for
+    /// rounded-corner masking. Zero for all other draw types.
+    round: [4]f32,
 };
+
+pub const Pipeline = enum { geom, text, image };
 
 pub const DrawCall = struct {
     index_start: u32,
     index_count: u32,
     scissor: ?[4]u32,
-    is_text: bool,
+    pipeline: Pipeline,
 };
 
 pub const BuildResult = struct {
@@ -31,15 +37,16 @@ pub fn build(
     idxs: []u32,
     draw_calls: []DrawCall,
     font_atlas: *font.FontAtlas,
+    image_atlas: *image_mod.ImageAtlas,
 ) BuildResult {
     var b = Builder{ .verts = verts, .idxs = idxs, .dcs = draw_calls };
-    b.beginBatch(null, false);
+    b.beginBatch(null, .geom);
 
     for (cmds) |cmd| {
         const bb = cmd.bounding_box;
         switch (cmd.command_type) {
             .rectangle => {
-                b.ensureMode(false);
+                b.ensureMode(.geom);
                 const rd = cmd.render_data.rectangle;
                 const col = clayColor(rd.background_color);
                 if (rd.corner_radius.top_left > 0) {
@@ -49,12 +56,25 @@ pub fn build(
                 }
             },
             .border => {
-                b.ensureMode(false);
+                b.ensureMode(.geom);
                 b.border(bb.x, bb.y, bb.width, bb.height, cmd.render_data.border);
             },
             .text => {
-                b.ensureMode(true);
+                b.ensureMode(.text);
                 b.text(bb.x, bb.y, cmd.render_data.text, font_atlas);
+            },
+            .image => {
+                b.ensureMode(.image);
+                const rd = cmd.render_data.image;
+                const id: u32 = @as(u32, @intCast(@intFromPtr(rd.image_data))) - 1;
+                if (id < image_atlas.images.items.len) {
+                    const info = image_atlas.images.items[id];
+                    const tint: [4]f32 = if (rd.background_color[3] == 0)
+                        .{ 1, 1, 1, 1 }
+                    else
+                        clayColor(rd.background_color);
+                    b.imageQuad(bb.x, bb.y, bb.width, bb.height, info, tint, rd.corner_radius.top_left);
+                }
             },
             .scissor_start => {
                 b.flush();
@@ -63,11 +83,11 @@ pub fn build(
                     @intFromFloat(@max(0, bb.y)),
                     @intFromFloat(@max(0, bb.width)),
                     @intFromFloat(@max(0, bb.height)),
-                }, b.is_text);
+                }, b.pipeline);
             },
             .scissor_end => {
                 b.flush();
-                b.beginBatch(null, false);
+                b.beginBatch(null, .geom);
             },
             else => {},
         }
@@ -90,19 +110,19 @@ const Builder = struct {
     dc: u32 = 0,
     batch_start: u32 = 0,
     scissor: ?[4]u32 = null,
-    is_text: bool = false,
+    pipeline: Pipeline = .geom,
     overflowed: bool = false,
 
-    fn beginBatch(b: *Builder, scissor: ?[4]u32, is_text: bool) void {
+    fn beginBatch(b: *Builder, scissor: ?[4]u32, pipeline: Pipeline) void {
         b.batch_start = b.ic;
         b.scissor = scissor;
-        b.is_text = is_text;
+        b.pipeline = pipeline;
     }
 
-    fn ensureMode(b: *Builder, want_text: bool) void {
-        if (b.is_text == want_text) return;
+    fn ensureMode(b: *Builder, want: Pipeline) void {
+        if (b.pipeline == want) return;
         b.flush();
-        b.is_text = want_text;
+        b.pipeline = want;
         b.batch_start = b.ic;
     }
 
@@ -113,7 +133,7 @@ const Builder = struct {
             .index_start = b.batch_start,
             .index_count = count,
             .scissor = b.scissor,
-            .is_text = b.is_text,
+            .pipeline = b.pipeline,
         };
         b.dc += 1;
         b.batch_start = b.ic;
@@ -126,7 +146,15 @@ const Builder = struct {
     fn v_uv(b: *Builder, x: f32, y: f32, u: f32, vv: f32, col: [4]f32) u32 {
         if (b.vc >= b.verts.len) { b.overflowed = true; return 0; }
         const i = b.vc;
-        b.verts[i] = .{ .pos = .{ x, y }, .color = col, .uv = .{ u, vv } };
+        b.verts[i] = .{ .pos = .{ x, y }, .color = col, .uv = .{ u, vv }, .round = .{ 0, 0, 0, 0 } };
+        b.vc += 1;
+        return i;
+    }
+
+    fn v_round(b: *Builder, x: f32, y: f32, atlas_u: f32, atlas_v: f32, local_u: f32, local_v: f32, rx: f32, ry: f32, col: [4]f32) u32 {
+        if (b.vc >= b.verts.len) { b.overflowed = true; return 0; }
+        const i = b.vc;
+        b.verts[i] = .{ .pos = .{ x, y }, .color = col, .uv = .{ atlas_u, atlas_v }, .round = .{ local_u, local_v, rx, ry } };
         b.vc += 1;
         return i;
     }
@@ -238,6 +266,17 @@ const Builder = struct {
             const in2  = b.v(cx + math.cos(ang2) * ri,     cy + math.sin(ang2) * ri,     col);
             b.quad(in1, out1, out2, in2);
         }
+    }
+
+    fn imageQuad(b: *Builder, x: f32, y: f32, w: f32, h: f32, info: image_mod.ImageInfo, tint: [4]f32, corner_r: f32) void {
+        if (w <= 0 or h <= 0) return;
+        const rx = if (w > 0) corner_r / w else 0;
+        const ry = if (h > 0) corner_r / h else 0;
+        const tl = b.v_round(x,     y,     info.u0, info.v0, 0, 0, rx, ry, tint);
+        const tr = b.v_round(x + w, y,     info.u1, info.v0, 1, 0, rx, ry, tint);
+        const br = b.v_round(x + w, y + h, info.u1, info.v1, 1, 1, rx, ry, tint);
+        const bl = b.v_round(x,     y + h, info.u0, info.v1, 0, 1, rx, ry, tint);
+        b.quad(tl, tr, br, bl);
     }
 
     fn text(b: *Builder, x: f32, y: f32, td: clay.TextRenderData, atlas: *font.FontAtlas) void {

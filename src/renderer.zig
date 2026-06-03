@@ -7,6 +7,7 @@ const Window = @import("window.zig").Window;
 const clay = @import("zclay");
 const rc = @import("render_commands.zig");
 const font = @import("font.zig");
+const image = @import("image.zig");
 
 pub const HardwareInfo = struct {
     gpu: [128]u8 = .{0} ** 128,
@@ -27,6 +28,7 @@ const max_draw_calls: u32 = 256;
 
 const geom_wgsl = @embedFile("clay.wgsl");
 const text_wgsl = @embedFile("clay_text.wgsl");
+const image_wgsl = @embedFile("clay_image.wgsl");
 
 const Uniforms = extern struct { projection: [16]f32 };
 
@@ -49,6 +51,8 @@ pub const Renderer = struct {
     geom_bg: zgpu.BindGroupHandle,
     text_pipeline: zgpu.RenderPipelineHandle,
     text_bg: zgpu.BindGroupHandle,
+    image_pipeline: zgpu.RenderPipelineHandle,
+    image_bg: zgpu.BindGroupHandle,
 
     vertex_buf: zgpu.BufferHandle,
     index_buf: zgpu.BufferHandle,
@@ -59,6 +63,7 @@ pub const Renderer = struct {
     cpu_dcs: []rc.DrawCall,
 
     font_atlas: font.FontAtlas,
+    image_atlas: image.ImageAtlas,
     last_time: f64,
 
     last_cmds_hash: u64 = 0,
@@ -114,6 +119,7 @@ pub const Renderer = struct {
             .{ .format = .float32x2, .offset = 0, .shader_location = 0 },
             .{ .format = .float32x4, .offset = @offsetOf(rc.Vertex, "color"), .shader_location = 1 },
             .{ .format = .float32x2, .offset = @offsetOf(rc.Vertex, "uv"), .shader_location = 2 },
+            .{ .format = .float32x4, .offset = @offsetOf(rc.Vertex, "round"), .shader_location = 3 },
         };
         const vbl = wgpu.VertexBufferLayout{
             .array_stride = @sizeOf(rc.Vertex),
@@ -206,6 +212,52 @@ pub const Renderer = struct {
             .{ .binding = 2, .sampler_handle = atlas.sampler },
         });
 
+        // ── Image pipeline ─────────────────────────────────────────────────
+        const img_atlas = try image.ImageAtlas.init(allocator, gctx);
+
+        const bgl_image = gctx.createBindGroupLayout(&.{
+            .{
+                .binding = 0,
+                .visibility = .{ .vertex = true },
+                .buffer = .{ .binding_type = .uniform, .min_binding_size = @sizeOf(Uniforms) },
+            },
+            .{
+                .binding = 1,
+                .visibility = .{ .fragment = true },
+                .texture = .{ .sample_type = .float, .view_dimension = .tvdim_2d, .multisampled = false },
+            },
+            .{
+                .binding = 2,
+                .visibility = .{ .fragment = true },
+                .sampler = .{ .binding_type = .filtering },
+            },
+        });
+        defer gctx.releaseResource(bgl_image);
+
+        const image_shader = zgpu.createWgslShaderModule(gctx.device, image_wgsl, "clay_image");
+        defer image_shader.release();
+
+        const image_frag = wgpu.FragmentState{
+            .module = image_shader,
+            .entry_point = "fs",
+            .target_count = 1,
+            .targets = @ptrCast(&color_target),
+        };
+        const image_pl = gctx.createPipelineLayout(&.{bgl_image});
+        defer gctx.releaseResource(image_pl);
+        const image_pipeline = gctx.createRenderPipeline(image_pl, .{
+            .vertex = .{ .module = image_shader, .entry_point = "vs", .buffer_count = 1, .buffers = @ptrCast(&vbl) },
+            .fragment = &image_frag,
+            .primitive = .{ .topology = .triangle_list },
+            .multisample = .{ .count = 4 },
+        });
+
+        const image_bg = gctx.createBindGroup(bgl_image, &.{
+            .{ .binding = 0, .buffer_handle = uniform_buf, .offset = 0, .size = @sizeOf(Uniforms) },
+            .{ .binding = 1, .texture_view_handle = img_atlas.texture_view },
+            .{ .binding = 2, .sampler_handle = img_atlas.sampler },
+        });
+
         // ── Geometry buffers ───────────────────────────────────────────────
         const vertex_buf = gctx.createBuffer(.{
             .usage = .{ .vertex = true, .copy_dst = true },
@@ -229,6 +281,8 @@ pub const Renderer = struct {
             .geom_bg = geom_bg,
             .text_pipeline = text_pipeline,
             .text_bg = text_bg,
+            .image_pipeline = image_pipeline,
+            .image_bg = image_bg,
             .vertex_buf = vertex_buf,
             .index_buf = index_buf,
             .uniform_buf = uniform_buf,
@@ -236,6 +290,7 @@ pub const Renderer = struct {
             .cpu_idxs = cpu_idxs,
             .cpu_dcs = cpu_dcs,
             .font_atlas = atlas,
+            .image_atlas = img_atlas,
             .last_time = zglfw.getTime(),
         };
     }
@@ -251,6 +306,12 @@ pub const Renderer = struct {
         const id = try self.font_atlas.addFont(font_data);
         clay.setMeasureTextFunction(*font.FontAtlas, &self.font_atlas, font.measureTextFn);
         return id;
+    }
+
+    /// Load a PNG image and return its image_id for use in clay image elements.
+    /// Pass @ptrFromInt(image_id) as the image_data in ImageElementConfig.
+    pub fn loadImage(self: *Renderer, png_data: []const u8) !u32 {
+        return self.image_atlas.addImage(png_data);
     }
 
     pub fn beginFrame(self: *Renderer) wgpu.TextureView {
@@ -320,9 +381,10 @@ pub const Renderer = struct {
 
         // Only update the gpu buffers if there is something new to show
         const new_hash = hashCmds(cmds);
-        if (new_hash != self.last_cmds_hash or self.font_atlas.dirty) {
+        if (new_hash != self.last_cmds_hash or self.font_atlas.dirty or self.image_atlas.dirty) {
             self.font_atlas.flush();
-            const result = rc.build(cmds, self.cpu_verts, self.cpu_idxs, self.cpu_dcs, &self.font_atlas);
+            self.image_atlas.flush();
+            const result = rc.build(cmds, self.cpu_verts, self.cpu_idxs, self.cpu_dcs, &self.font_atlas, &self.image_atlas);
 
             if (result.vertex_count > 0) {
                 gctx.queue.writeBuffer(gctx.lookupResource(self.vertex_buf).?, 0, rc.Vertex, self.cpu_verts[0..result.vertex_count]);
@@ -375,10 +437,12 @@ pub const Renderer = struct {
 
             const geom_bg = gctx.lookupResource(self.geom_bg).?;
             const text_bg = gctx.lookupResource(self.text_bg).?;
+            const image_bg = gctx.lookupResource(self.image_bg).?;
             const geom_pipe = gctx.lookupResource(self.geom_pipeline).?;
             const text_pipe = gctx.lookupResource(self.text_pipeline).?;
+            const image_pipe = gctx.lookupResource(self.image_pipeline).?;
 
-            var active_text: ?bool = null;
+            var active_pipeline: ?rc.Pipeline = null;
 
             for (self.cpu_dcs[0..self.cached_draw_call_count]) |dc| {
                 // Scissor from clay is in logical pixels — convert to physical, then
@@ -393,15 +457,22 @@ pub const Renderer = struct {
                 const sy = @min(s[1], fb_h);
                 pass.setScissorRect(sx, sy, @min(s[2], fb_w - sx), @min(s[3], fb_h - sy));
 
-                if (active_text == null or active_text.? != dc.is_text) {
-                    if (dc.is_text) {
-                        pass.setPipeline(text_pipe);
-                        pass.setBindGroup(0, text_bg, null);
-                    } else {
-                        pass.setPipeline(geom_pipe);
-                        pass.setBindGroup(0, geom_bg, null);
+                if (active_pipeline == null or active_pipeline.? != dc.pipeline) {
+                    switch (dc.pipeline) {
+                        .geom => {
+                            pass.setPipeline(geom_pipe);
+                            pass.setBindGroup(0, geom_bg, null);
+                        },
+                        .text => {
+                            pass.setPipeline(text_pipe);
+                            pass.setBindGroup(0, text_bg, null);
+                        },
+                        .image => {
+                            pass.setPipeline(image_pipe);
+                            pass.setBindGroup(0, image_bg, null);
+                        },
                     }
-                    active_text = dc.is_text;
+                    active_pipeline = dc.pipeline;
                 }
 
                 pass.drawIndexed(dc.index_count, 1, dc.index_start, 0, 0);
@@ -445,6 +516,7 @@ pub const Renderer = struct {
 
     pub fn deinit(self: *Renderer) void {
         self.font_atlas.deinit();
+        self.image_atlas.deinit();
         self.alloc.free(self.cpu_verts);
         self.alloc.free(self.cpu_idxs);
         self.alloc.free(self.cpu_dcs);

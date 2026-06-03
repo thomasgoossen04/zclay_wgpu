@@ -410,7 +410,7 @@ fn analyticsContent(font_id: u16) void {
     }
 }
 
-fn usersContent(font_id: u16) void {
+fn usersContent(font_id: u16, profile_image_id: u32) void {
     const users = [_]struct { name: []const u8, role: []const u8, status: []const u8, col: clay.Color }{
         .{ .name = "Alice Johnson", .role = "Admin", .status = "Online", .col = success },
         .{ .name = "Bob Martinez", .role = "Developer", .status = "Online", .col = success },
@@ -436,12 +436,10 @@ fn usersContent(font_id: u16) void {
         })({
             clay.UI()(.{
                 .id = clay.ElementId.IDI("Avatar", @intCast(i)),
-                .layout = .{ .sizing = .{ .w = .fixed(36), .h = .fixed(36) }, .child_alignment = .{ .x = .center, .y = .center } },
-                .background_color = u.col,
+                .layout = .{ .sizing = .{ .w = .fixed(36), .h = .fixed(36) } },
+                .image = .{ .image_data = @ptrFromInt(profile_image_id + 1) },
                 .corner_radius = .all(18),
-            })({
-                clay.text(u.name[0..1], .{ .font_id = font_id, .font_size = 16, .color = .{ 10, 12, 20, 255 } });
-            });
+            })({});
 
             clay.UI()(.{
                 .id = clay.ElementId.IDI("UserInfo", @intCast(i)),
@@ -661,7 +659,7 @@ fn profilingContent(state: *State, font_id: u16) void {
 }
 
 // ── Root layout ───────────────────────────────────────────────────────────────
-fn createLayout(state: *State, font_id: u16, clicked: bool) void {
+fn createLayout(state: *State, font_id: u16, profile_image_id: u32, clicked: bool) void {
     clay.UI()(.{
         .id = .ID("Root"),
         .layout = .{ .direction = .top_to_bottom, .sizing = .grow },
@@ -752,7 +750,7 @@ fn createLayout(state: *State, font_id: u16, clicked: bool) void {
                         switch (state.tab) {
                             .overview => overviewContent(state, font_id, clicked),
                             .analytics => analyticsContent(font_id),
-                            .users => usersContent(font_id),
+                            .users => usersContent(font_id, profile_image_id),
                             .settings => settingsContent(state, font_id, clicked),
                             .profiling => profilingContent(state, font_id),
                         }
@@ -797,6 +795,15 @@ pub fn main(init: std.process.Init) !void {
     defer r.deinit();
 
     const font_id = try r.loadFont(space_mono);
+    const png_bytes = try std.Io.Dir.readFileAlloc(
+        std.Io.Dir.cwd(),
+        io,
+        "example/resources/no-profile-picture-icon.png",
+        counting_alloc.allocator(),
+        .unlimited,
+    );
+    defer counting_alloc.allocator().free(png_bytes);
+    const profile_image_id = try r.loadImage(png_bytes);
     var state = State{};
     state.hw = r.getHardwareInfo();
     var prev_mouse = false;
@@ -827,7 +834,7 @@ pub fn main(init: std.process.Init) !void {
         // ── Layout (timed for the profiling page) ─────────────────────────
         const layout_start = std.Io.Clock.awake.now(io);
         if (r.ui_fits) {
-            createLayout(&state, font_id, clicked);
+            createLayout(&state, font_id, profile_image_id, clicked);
         } else {
             overflowLayout(font_id);
         }
