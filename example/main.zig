@@ -2,7 +2,73 @@ const std = @import("std");
 const zcw = @import("zclay_wgpu");
 const clay = zcw.clay;
 
-// ── Palette ──────────────────────────────────────────────────────────────────
+// ── Counting allocator ────────────────────────────────────────────────────────
+const CountingAllocator = struct {
+    child: std.mem.Allocator,
+    current: usize = 0,
+    peak: usize = 0,
+
+    pub fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.child.rawAlloc(len, alignment, ret_addr);
+        if (result != null) {
+            self.current += len;
+            if (self.current > self.peak) self.peak = self.current;
+        }
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (new_len > memory.len) {
+            self.current += new_len - memory.len;
+            if (self.current > self.peak) self.peak = self.current;
+        } else {
+            self.current -= memory.len - new_len;
+        }
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.child.rawRemap(memory, alignment, new_len, ret_addr);
+        if (result != null) {
+            if (new_len > memory.len) {
+                self.current += new_len - memory.len;
+                if (self.current > self.peak) self.peak = self.current;
+            } else {
+                self.current -= memory.len - new_len;
+            }
+        }
+        return result;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+        self.current -= memory.len;
+    }
+};
+
+fn fmtBytes(buf: []u8, n: usize) []const u8 {
+    if (n >= 1024 * 1024)
+        return std.fmt.bufPrint(buf, "{d:.1} MB", .{@as(f32, @floatFromInt(n)) / (1024.0 * 1024.0)}) catch "?";
+    return std.fmt.bufPrint(buf, "{d:.0} KB", .{@as(f32, @floatFromInt(n)) / 1024.0}) catch "?";
+}
+
+// ── Palette ───────────────────────────────────────────────────────────────────
 const bg: clay.Color = .{ 10, 12, 20, 255 };
 const surface: clay.Color = .{ 18, 22, 36, 255 };
 const card: clay.Color = .{ 26, 32, 52, 255 };
@@ -41,13 +107,18 @@ const State = struct {
     display_fps: f32 = 0,
     display_frame_time_ms: f32 = 0,
     display_layout_time_ms: f32 = 0,
-    display_timer_ms: f32 = 0,
+    display_mem_bytes: usize = 0,
+    display_mem_peak_bytes: usize = 0,
     fps_buf: [20]u8 = undefined,
     frame_time_buf: [20]u8 = undefined,
     layout_time_buf: [20]u8 = undefined,
     avg_buf: [20]u8 = undefined,
     min_buf: [20]u8 = undefined,
     max_buf: [20]u8 = undefined,
+    mem_buf: [24]u8 = undefined,
+    mem_sub_buf: [32]u8 = undefined,
+    mem_peak_buf: [24]u8 = undefined,
+    hw: zcw.HardwareInfo = .{},
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -463,15 +534,19 @@ fn profilingContent(state: *State, font_id: u16) void {
     const avg_str = std.fmt.bufPrint(&state.avg_buf, "{d:.2} ms", .{avg_ft}) catch "?";
     const min_str = std.fmt.bufPrint(&state.min_buf, "{d:.2} ms", .{min_ft}) catch "?";
     const max_str = std.fmt.bufPrint(&state.max_buf, "{d:.2} ms", .{max_ft}) catch "?";
+    const mem_str = fmtBytes(&state.mem_buf, state.display_mem_bytes);
+    const mem_peak_str = fmtBytes(&state.mem_peak_buf, state.display_mem_peak_bytes);
+    const mem_sub = std.fmt.bufPrint(&state.mem_sub_buf, "peak {s}", .{mem_peak_str}) catch "?";
 
     // ── Stat cards ────────────────────────────────────────────────────────────
     clay.UI()(.{
         .id = .ID("ProfStatsRow"),
         .layout = .{ .sizing = .{ .w = .grow }, .child_gap = 12 },
     })({
-        statCard("ProfFPS", "FPS", fps_str, "frames per second", success, font_id);
-        statCard("ProfFT", "Frame Time", ft_str, "wall clock per frame", accent, font_id);
+        statCard("ProfFPS", "Render FPS", fps_str, "excl. vsync sleep", success, font_id);
+        statCard("ProfFT", "Frame Time", ft_str, "render work, excl. sleep", accent, font_id);
         statCard("ProfLT", "Layout Time", lt_str, "clay compute time", warning, font_id);
+        statCard("ProfMem", "Heap", mem_str, mem_sub, text_muted, font_id);
     });
 
     // ── Frame time history chart ──────────────────────────────────────────────
@@ -558,6 +633,29 @@ fn profilingContent(state: *State, font_id: u16) void {
             timingRow("StatMin", "Minimum", min_str, success, font_id);
             timingRow("StatAvg", "Average", avg_str, accent, font_id);
             timingRow("StatMax", "Maximum", max_str, danger, font_id);
+        });
+
+        // Hardware info
+        clay.UI()(.{
+            .id = .ID("ProfSysCard"),
+            .layout = .{
+                .direction = .top_to_bottom,
+                .sizing = .{ .w = .grow },
+                .padding = .all(16),
+                .child_gap = 4,
+            },
+            .background_color = card,
+            .corner_radius = .all(10),
+            .border = .{ .color = border, .width = .outside(1) },
+        })({
+            clay.text("System", .{ .font_id = font_id, .font_size = 13, .color = text_muted });
+            clay.UI()(.{ .id = .ID("ProfSSep"), .layout = .{ .sizing = .{ .h = .fixed(6) } } })({});
+            timingRow("HwGPU", "GPU", state.hw.gpu[0..state.hw.gpu_len], accent, font_id);
+            timingRow("HwBackend", "API", state.hw.backend[0..state.hw.backend_len], warning, font_id);
+            timingRow("HwType", "Type", state.hw.adapter_type[0..state.hw.adapter_type_len], text_muted, font_id);
+            timingRow("HwDisplay", "Display", state.hw.display[0..state.hw.display_len], success, font_id);
+            timingRow("HwCPU", "CPU", state.hw.cpu_arch, text_muted, font_id);
+            timingRow("HwOS", "OS", state.hw.os_name, text_muted, font_id);
         });
     });
 }
@@ -693,29 +791,24 @@ pub fn main(init: std.process.Init) !void {
     w.setFpsTarget(60);
     defer w.deinit();
 
-    var r = try zcw.Renderer.init(init.gpa, w);
+    var counting_alloc = CountingAllocator{ .child = init.gpa };
+    var r = try zcw.Renderer.init(counting_alloc.allocator(), w, true);
+    var last_display_update = std.Io.Clock.awake.now(io);
     defer r.deinit();
 
     const font_id = try r.loadFont(space_mono);
     var state = State{};
+    state.hw = r.getHardwareInfo();
     var prev_mouse = false;
     var prev_f1 = false;
 
-    var frame_start = std.Io.Clock.awake.now(io);
-    r.setUiScale(2);
+    r.setUiScale(1.8);
 
     while (!w.shouldClose()) {
-        // ── Frame timing ──────────────────────────────────────────────────
-        const frame_ns = frame_start.untilNow(io, .awake).toNanoseconds();
-        frame_start = std.Io.Clock.awake.now(io);
-        state.frame_time_ms = @as(f32, @floatFromInt(frame_ns)) / 1_000_000.0;
-        state.fps = if (state.frame_time_ms > 0.001) 1000.0 / state.frame_time_ms else 9999.0;
-        state.frame_history[state.frame_history_idx % 60] = state.frame_time_ms;
-        state.frame_history_idx +%= 1;
-
         if (w.keyPressed(.equal)) r.setUiScale(r.font_atlas.ui_scale + 0.1);
         if (w.keyPressed(.minus)) r.setUiScale(r.font_atlas.ui_scale - 0.1);
 
+        const frame_start = std.Io.Clock.awake.now(io);
         w.beginFrame(io);
 
         const mouse_now = w.mouseDown();
@@ -739,15 +832,24 @@ pub fn main(init: std.process.Init) !void {
             overflowLayout(font_id);
         }
         state.layout_time_ms = @as(f32, @floatFromInt(layout_start.untilNow(io, .awake).toNanoseconds())) / 1_000_000.0;
-        state.display_timer_ms += state.frame_time_ms;
-        if (state.display_timer_ms >= 200.0) {
+
+        r.endFrame(back_buffer);
+
+        // ── Frame timing — measured after render, before the fps sleep ────
+        const frame_ns = frame_start.untilNow(io, .awake).toNanoseconds();
+        state.frame_time_ms = @as(f32, @floatFromInt(frame_ns)) / 1_000_000.0;
+        state.fps = if (state.frame_time_ms > 0.001) 1000.0 / state.frame_time_ms else 9999.0;
+        state.frame_history[state.frame_history_idx % 60] = state.frame_time_ms;
+        state.frame_history_idx +%= 1;
+
+        if (last_display_update.untilNow(io, .awake).toNanoseconds() >= 200_000_000) {
             state.display_fps = state.fps;
             state.display_frame_time_ms = state.frame_time_ms;
             state.display_layout_time_ms = state.layout_time_ms;
-            state.display_timer_ms = 0;
+            state.display_mem_bytes = counting_alloc.current;
+            state.display_mem_peak_bytes = counting_alloc.peak;
+            last_display_update = std.Io.Clock.awake.now(io);
         }
-
-        r.endFrame(back_buffer);
 
         w.endFrame(io);
     }

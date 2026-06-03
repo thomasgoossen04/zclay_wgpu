@@ -1,5 +1,6 @@
 pub const Window = @import("window.zig").Window;
 pub const Renderer = @import("renderer.zig").Renderer;
+pub const HardwareInfo = @import("renderer.zig").HardwareInfo;
 pub const clay = @import("zclay");
 pub const Key = @import("zglfw").Key;
 
