@@ -28,10 +28,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Deps
-    const zgpu = b.dependency("zgpu", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const zgpu = b.dependency("zgpu", .{});
     mod.addImport("zgpu", zgpu.module("root"));
     const zclay = b.dependency("zclay", .{
         .target = target,
@@ -80,4 +77,79 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    const release_step = b.step("release", "Build release binaries for all platforms");
+    const release_targets = [_]struct { name: []const u8, query: std.Target.Query }{
+        .{ .name = "x86_64-linux", .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu } },
+        .{ .name = "aarch64-macos", .query = .{ .cpu_arch = .aarch64, .os_tag = .macos } },
+        .{ .name = "x86_64-macos", .query = .{ .cpu_arch = .x86_64, .os_tag = .macos } },
+        // Windows currently does not work for cross compilation (some issue in deps)
+        //.{ .name = "x86_64-windows", .query = .{ .cpu_arch = .x86_64, .os_tag = .windows } },
+    };
+    for (release_targets) |rt| {
+        const release_target = b.resolveTargetQuery(rt.query);
+        const release_zgpu = b.dependency("zgpu", .{ .target = release_target, .optimize = .ReleaseFast });
+        const release_zclay = b.dependency("zclay", .{ .target = release_target, .optimize = .ReleaseFast });
+        const release_zglfw = b.dependency("zglfw", .{ .target = release_target, .optimize = .ReleaseFast });
+        const release_truetype = b.dependency("TrueType", .{});
+        const release_lib_mod = b.createModule(.{
+            .root_source_file = b.path("src/zclay_wgpu.zig"),
+            .target = release_target,
+            .optimize = .ReleaseFast,
+        });
+        release_lib_mod.addImport("zgpu", release_zgpu.module("root"));
+        release_lib_mod.addImport("zclay", release_zclay.module("zclay"));
+        release_lib_mod.addImport("zglfw", release_zglfw.module("root"));
+        release_lib_mod.addImport("TrueType", release_truetype.module("TrueType"));
+        release_lib_mod.linkLibrary(release_zglfw.artifact("glfw"));
+
+        const release_exe = b.addExecutable(.{
+            .name = "zclay_wgpu",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("example/main.zig"),
+                .target = release_target,
+                .optimize = .ReleaseFast,
+                .imports = &.{
+                    .{ .name = "zclay_wgpu", .module = release_lib_mod },
+                },
+            }),
+        });
+
+        release_exe.root_module.linkLibrary(release_zgpu.artifact("zdawn"));
+        @import("zgpu").addLibraryPathsTo(release_exe);
+
+        // zglfw/system_sdk paths do not propagate to the final link step.
+        if (release_zglfw.builder.lazyDependency("system_sdk", .{})) |system_sdk| {
+            switch (release_target.result.os.tag) {
+                .linux => {
+                    if (release_target.result.cpu.arch.isX86()) {
+                        release_exe.root_module.addLibraryPath(
+                            system_sdk.path("linux/lib/x86_64-linux-gnu"),
+                        );
+                    } else if (release_target.result.cpu.arch.isAARCH64()) {
+                        release_exe.root_module.addLibraryPath(
+                            system_sdk.path("linux/lib/aarch64-linux-gnu"),
+                        );
+                    }
+                },
+                .macos => {
+                    release_exe.root_module.addFrameworkPath(
+                        system_sdk.path("macos12/System/Library/Frameworks"),
+                    );
+                    release_exe.root_module.addLibraryPath(
+                        system_sdk.path("macos12/usr/lib"),
+                    );
+                    release_exe.root_module.addSystemIncludePath(
+                        system_sdk.path("macos12/usr/include"),
+                    );
+                },
+                else => {},
+            }
+        }
+
+        const install = b.addInstallArtifact(release_exe, .{
+            .dest_dir = .{ .override = .{ .custom = b.fmt("release/{s}", .{rt.name}) } },
+        });
+        release_step.dependOn(&install.step);
+    }
 }
