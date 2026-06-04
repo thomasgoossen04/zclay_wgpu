@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .zgpu = .{
-            .url = "git+https://github.com/thomasgoossen04/zgpu.git#876c55cff2cc171e352dda9b980cb4bc79e9f581",
-            .hash = "zgpu-0.12.0-dev-nqFT5MCoCACmc0QEjyzZiWN8GPwdN-ZyuLw3a1QoCk7Y",
+            .url = "git+https://github.com/thomasgoossen04/zgpu.git#7a5480cd4fbaaff70c4718319c1da6e1e63a19bc",
+            .hash = "zgpu-0.12.0-dev-nqFT5GWpCABQBzZkw8zcFikodLS-9S_YOYRzahnXJp-y",
         },
         .dawn_x86_64_windows_gnu = .{
             .url = "https://github.com/michal-z/webgpu_dawn-x86_64-windows-gnu/archive/d3a68014e6b6b53fd330a0ccba99e4dcfffddae5.tar.gz",

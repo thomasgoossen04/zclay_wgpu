@@ -123,25 +123,19 @@ pub fn build(b: *std.Build) void {
             switch (release_target.result.os.tag) {
                 .linux => {
                     if (release_target.result.cpu.arch.isX86()) {
-                        release_exe.root_module.addLibraryPath(
-                            system_sdk.path("linux/lib/x86_64-linux-gnu"),
-                        );
+                        const lib_path = system_sdk.path("linux/lib/x86_64-linux-gnu");
+                        release_lib_mod.addLibraryPath(lib_path);
+                        release_exe.root_module.addLibraryPath(lib_path);
                     } else if (release_target.result.cpu.arch.isAARCH64()) {
-                        release_exe.root_module.addLibraryPath(
-                            system_sdk.path("linux/lib/aarch64-linux-gnu"),
-                        );
+                        const lib_path = system_sdk.path("linux/lib/aarch64-linux-gnu");
+                        release_lib_mod.addLibraryPath(lib_path);
+                        release_exe.root_module.addLibraryPath(lib_path);
                     }
                 },
                 .macos => {
-                    release_exe.root_module.addFrameworkPath(
-                        system_sdk.path("macos12/System/Library/Frameworks"),
-                    );
-                    release_exe.root_module.addLibraryPath(
-                        system_sdk.path("macos12/usr/lib"),
-                    );
-                    release_exe.root_module.addSystemIncludePath(
-                        system_sdk.path("macos12/usr/include"),
-                    );
+                    release_exe.root_module.addFrameworkPath(system_sdk.path("macos12/System/Library/Frameworks"));
+                    release_exe.root_module.addLibraryPath(system_sdk.path("macos12/usr/lib"));
+                    release_exe.root_module.addSystemIncludePath(system_sdk.path("macos12/usr/include"));
                 },
                 else => {},
             }
