@@ -42,6 +42,8 @@ pub fn build(b: *std.Build) void {
     mod.addImport("zglfw", zglfw.module("root"));
     const truetype = b.dependency("TrueType", .{});
     mod.addImport("TrueType", truetype.module("TrueType"));
+    const zvec = b.dependency("zvec", .{});
+    mod.addImport("zvec", zvec.module("zvec"));
 
     if (target.result.os.tag != .emscripten) {
         mod.linkLibrary(zglfw.artifact("glfw"));
@@ -92,6 +94,7 @@ pub fn build(b: *std.Build) void {
         const release_zclay = b.dependency("zclay", .{ .target = release_target, .optimize = .ReleaseFast });
         const release_zglfw = b.dependency("zglfw", .{ .target = release_target, .optimize = .ReleaseFast });
         const release_truetype = b.dependency("TrueType", .{});
+        const release_zvec = b.dependency("zvec", .{ .target = release_target, .optimize = .ReleaseFast });
         const release_lib_mod = b.createModule(.{
             .root_source_file = b.path("src/zclay_wgpu.zig"),
             .target = release_target,
@@ -101,6 +104,7 @@ pub fn build(b: *std.Build) void {
         release_lib_mod.addImport("zclay", release_zclay.module("zclay"));
         release_lib_mod.addImport("zglfw", release_zglfw.module("root"));
         release_lib_mod.addImport("TrueType", release_truetype.module("TrueType"));
+        release_lib_mod.addImport("zvec", release_zvec.module("zvec"));
         release_lib_mod.linkLibrary(release_zglfw.artifact("glfw"));
 
         const release_exe = b.addExecutable(.{

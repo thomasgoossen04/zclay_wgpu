@@ -8,6 +8,7 @@ const clay = @import("zclay");
 const rc = @import("render_commands.zig");
 const font = @import("font.zig");
 const image = @import("image.zig");
+const CustomElementData = @import("custom_element.zig").CustomElementData;
 
 pub const HardwareInfo = struct {
     gpu: [128]u8 = .{0} ** 128,
@@ -384,7 +385,7 @@ pub const Renderer = struct {
         if (new_hash != self.last_cmds_hash or self.font_atlas.dirty or self.image_atlas.dirty) {
             self.font_atlas.flush();
             self.image_atlas.flush();
-            const result = rc.build(cmds, self.cpu_verts, self.cpu_idxs, self.cpu_dcs, &self.font_atlas, &self.image_atlas);
+            const result = rc.build(self.alloc, cmds, self.cpu_verts, self.cpu_idxs, self.cpu_dcs, &self.font_atlas, &self.image_atlas);
 
             if (result.vertex_count > 0) {
                 gctx.queue.writeBuffer(gctx.lookupResource(self.vertex_buf).?, 0, rc.Vertex, self.cpu_verts[0..result.vertex_count]);
@@ -459,7 +460,7 @@ pub const Renderer = struct {
 
                 if (active_pipeline == null or active_pipeline.? != dc.pipeline) {
                     switch (dc.pipeline) {
-                        .geom => {
+                        .geom, .vec => {
                             pass.setPipeline(geom_pipe);
                             pass.setBindGroup(0, geom_bg, null);
                         },
@@ -583,6 +584,32 @@ fn hashCmds(cmds: []const clay.RenderCommand) u64 {
                 h.update(std.mem.asBytes(&td.font_size));
                 h.update(std.mem.asBytes(&td.letter_spacing));
                 h.update(std.mem.asBytes(&td.line_height));
+            },
+            .custom => {
+                const cd = cmd.render_data.custom;
+                if (cd.custom_data) |ptr| {
+                    const elem: *const CustomElementData = @ptrCast(@alignCast(ptr));
+                    switch (elem.*) {
+                        .vector_graphic => |vg| {
+                            h.update(std.mem.asBytes(&vg.width));
+                            h.update(std.mem.asBytes(&vg.height));
+                            for (vg.commands) |vcmd| {
+                                h.update(std.mem.sliceAsBytes(vcmd.path.verbs));
+                                h.update(std.mem.sliceAsBytes(vcmd.path.points));
+                                if (vcmd.fill) |fill| {
+                                    h.update(std.mem.asBytes(&fill.paint.solid));
+                                    h.update(std.mem.asBytes(&fill.opacity));
+                                }
+                                if (vcmd.stroke) |stroke| {
+                                    h.update(std.mem.asBytes(&stroke.paint.solid));
+                                    h.update(std.mem.asBytes(&stroke.width));
+                                    h.update(std.mem.asBytes(&stroke.opacity));
+                                }
+                                h.update(std.mem.asBytes(&vcmd.transform));
+                            }
+                        },
+                    }
+                }
             },
             else => {
                 // No content-relevant pointers in rectangle/border/scissor/image data.

@@ -1,6 +1,8 @@
 pub const Window = @import("window.zig").Window;
 pub const Renderer = @import("renderer.zig").Renderer;
 pub const HardwareInfo = @import("renderer.zig").HardwareInfo;
+pub const CustomElementData = @import("custom_element.zig").CustomElementData;
+pub const zvec = @import("zvec");
 pub const clay = @import("zclay");
 pub const Key = @import("zglfw").Key;
 

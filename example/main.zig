@@ -1,6 +1,7 @@
 const std = @import("std");
 const zcw = @import("zclay_wgpu");
 const clay = zcw.clay;
+const zvec = zcw.zvec;
 
 // ── Counting allocator ────────────────────────────────────────────────────────
 const CountingAllocator = struct {
@@ -86,7 +87,7 @@ const border: clay.Color = .{ 38, 45, 72, 255 };
 const transparent: clay.Color = .{ 0, 0, 0, 0 };
 
 // ── App state ─────────────────────────────────────────────────────────────────
-const Tab = enum(u8) { overview, analytics, users, settings, profiling };
+const Tab = enum(u8) { overview, analytics, users, settings, profiling, vector };
 
 const State = struct {
     tab: Tab = .overview,
@@ -96,6 +97,9 @@ const State = struct {
     debug_mode: bool = false,
     log_buf: [64]u8 = undefined,
     counter_buf: [16]u8 = undefined,
+
+    // Accumulated wall time for vector graphics animation
+    vec_time: f32 = 0,
 
     // Profiling (raw — updated every frame)
     frame_time_ms: f32 = 0,
@@ -658,8 +662,256 @@ fn profilingContent(state: *State, font_id: u16) void {
     });
 }
 
+// ── Vector graphics tab ───────────────────────────────────────────────────────
+
+// PathBuf mirrors zvec.PathBuilder but passes the allocator per-operation,
+// matching Zig 0.16's unmanaged ArrayList API.
+const PathBuf = struct {
+    verbs: std.ArrayList(zvec.PathVerb),
+    pts: std.ArrayList(zvec.Point),
+    alloc: std.mem.Allocator,
+    cursor: zvec.Point = .{ .x = 0, .y = 0 },
+    start: zvec.Point = .{ .x = 0, .y = 0 },
+
+    fn init(a: std.mem.Allocator) PathBuf {
+        return .{ .verbs = .empty, .pts = .empty, .alloc = a };
+    }
+    fn moveTo(b: *PathBuf, x: f32, y: f32) void {
+        b.verbs.append(b.alloc, .move_to) catch return;
+        b.pts.append(b.alloc, .{ .x = x, .y = y }) catch return;
+        b.cursor = .{ .x = x, .y = y };
+        b.start = b.cursor;
+    }
+    fn lineTo(b: *PathBuf, x: f32, y: f32) void {
+        b.verbs.append(b.alloc, .line_to) catch return;
+        b.pts.append(b.alloc, .{ .x = x, .y = y }) catch return;
+        b.cursor = .{ .x = x, .y = y };
+    }
+    fn cubicTo(b: *PathBuf, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) void {
+        b.verbs.append(b.alloc, .cubic_to) catch return;
+        b.pts.append(b.alloc, .{ .x = c1x, .y = c1y }) catch return;
+        b.pts.append(b.alloc, .{ .x = c2x, .y = c2y }) catch return;
+        b.pts.append(b.alloc, .{ .x = x, .y = y }) catch return;
+        b.cursor = .{ .x = x, .y = y };
+    }
+    fn close(b: *PathBuf) void {
+        b.verbs.append(b.alloc, .close) catch return;
+        b.cursor = b.start;
+    }
+    fn path(b: *const PathBuf) zvec.Path {
+        return .{ .verbs = b.verbs.items, .points = b.pts.items };
+    }
+};
+
+fn solidPaint(r: f32, g: f32, b: f32, a: f32) zvec.Paint {
+    return .{
+        .solid = .{ r, g, b, a },
+        .linear_gradient = .{ .p0 = .{ .x = 0, .y = 0 }, .p1 = .{ .x = 0, .y = 0 }, .stops = &.{} },
+        .radial_gradient = .{ .center = .{ .x = 0, .y = 0 }, .radius = 0, .stops = &.{} },
+    };
+}
+
+// 5-point star that pulses and rotates.
+fn buildStar(alloc: std.mem.Allocator, t: f32) !*zcw.CustomElementData {
+    var pb = PathBuf.init(alloc);
+    const cx = 50.0;
+    const cy = 50.0;
+    const n = 5;
+    const outer_r = 42.0 + 5.0 * @sin(t * 1.7);
+    const inner_r = outer_r * (0.38 + 0.08 * @sin(t * 2.3));
+    const rot = t * 0.5 - std.math.pi / 2.0;
+
+    for (0..n * 2) |i| {
+        const a = rot + @as(f32, @floatFromInt(i)) * std.math.pi / @as(f32, @floatFromInt(n));
+        const r = if (i % 2 == 0) outer_r else inner_r;
+        const x = cx + r * @cos(a);
+        const y = cy + r * @sin(a);
+        if (i == 0) pb.moveTo(x, y) else pb.lineTo(x, y);
+    }
+    pb.close();
+
+    const cmds = try alloc.alloc(zvec.VecCommand, 1);
+    cmds[0] = .{
+        .path = pb.path(),
+        .fill = .{ .paint = solidPaint(99.0 / 255.0, 102.0 / 255.0, 241.0 / 255.0, 1.0) },
+        .stroke = .{ .paint = solidPaint(1.0, 1.0, 1.0, 0.45), .width = 1.5 },
+    };
+    const elem = try alloc.create(zcw.CustomElementData);
+    elem.* = .{ .vector_graphic = .{ .width = 100, .height = 100, .commands = cmds } };
+    return elem;
+}
+
+// Lissajous parametric curve: x=sin(3u), y=sin(2u+t). Shape morphs as t advances.
+fn buildLissajous(alloc: std.mem.Allocator, t: f32) !*zcw.CustomElementData {
+    var pb = PathBuf.init(alloc);
+    const n = 240;
+    for (0..n + 1) |i| {
+        const u = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n)) * 2.0 * std.math.pi;
+        const x = 50.0 + 44.0 * @sin(3.0 * u);
+        const y = 50.0 + 44.0 * @sin(2.0 * u + t);
+        if (i == 0) pb.moveTo(x, y) else pb.lineTo(x, y);
+    }
+
+    const cmds = try alloc.alloc(zvec.VecCommand, 1);
+    cmds[0] = .{
+        .path = pb.path(),
+        .stroke = .{ .paint = solidPaint(99.0 / 255.0, 102.0 / 255.0, 241.0 / 255.0, 0.9), .width = 1.8 },
+    };
+    const elem = try alloc.create(zcw.CustomElementData);
+    elem.* = .{ .vector_graphic = .{ .width = 100, .height = 100, .commands = cmds } };
+    return elem;
+}
+
+// Adds one petal to `pb` pointing in direction `angle`, using cubic beziers.
+fn addPetal(pb: *PathBuf, cx: f32, cy: f32, angle: f32, len: f32, w: f32) void {
+    const ca = @cos(angle);
+    const sa = @sin(angle);
+    const cn = -@sin(angle); // cos(angle + π/2)
+    const sn = @cos(angle); // sin(angle + π/2)
+
+    const tx = cx + len * ca;
+    const ty = cy + len * sa;
+    // Right-side cubic: center → tip
+    const c0x = cx + w * cn + len * 0.4 * ca;
+    const c0y = cy + w * sn + len * 0.4 * sa;
+    const c1x = tx + w * 0.4 * cn - len * 0.25 * ca;
+    const c1y = ty + w * 0.4 * sn - len * 0.25 * sa;
+    // Left-side cubic: tip → center
+    const c2x = tx - w * 0.4 * cn - len * 0.25 * ca;
+    const c2y = ty - w * 0.4 * sn - len * 0.25 * sa;
+    const c3x = cx - w * cn + len * 0.4 * ca;
+    const c3y = cy - w * sn + len * 0.4 * sa;
+
+    pb.moveTo(cx, cy);
+    pb.cubicTo(c0x, c0y, c1x, c1y, tx, ty);
+    pb.cubicTo(c2x, c2y, c3x, c3y, cx, cy);
+    pb.close();
+}
+
+// Six-petal flower with cubic-bezier petals and a center disc. Rotates and blooms.
+fn buildFlower(alloc: std.mem.Allocator, t: f32) !*zcw.CustomElementData {
+    const n_petals = 6;
+    const cx = 50.0;
+    const cy = 50.0;
+    const petal_len = 32.0 + 5.0 * @sin(t * 1.1);
+    const petal_w = 11.0 + 2.0 * @sin(t * 0.9);
+    const rot = t * 0.25;
+
+    // One VecCommand per petal + one for the center disc
+    const cmds = try alloc.alloc(zvec.VecCommand, n_petals + 1);
+
+    const petal_colors = [n_petals][4]f32{
+        .{ 99.0 / 255.0, 102.0 / 255.0, 241.0 / 255.0, 0.9 },
+        .{ 139.0 / 255.0, 92.0 / 255.0, 246.0 / 255.0, 0.9 },
+        .{ 59.0 / 255.0, 130.0 / 255.0, 246.0 / 255.0, 0.9 },
+        .{ 99.0 / 255.0, 102.0 / 255.0, 241.0 / 255.0, 0.9 },
+        .{ 139.0 / 255.0, 92.0 / 255.0, 246.0 / 255.0, 0.9 },
+        .{ 59.0 / 255.0, 130.0 / 255.0, 246.0 / 255.0, 0.9 },
+    };
+
+    for (0..n_petals) |i| {
+        var pb = PathBuf.init(alloc);
+        const angle = rot + @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_petals)) * 2.0 * std.math.pi;
+        addPetal(&pb, cx, cy, angle, petal_len, petal_w);
+        const col = petal_colors[i];
+        cmds[i] = .{
+            .path = pb.path(),
+            .fill = .{ .paint = solidPaint(col[0], col[1], col[2], col[3]) },
+            .stroke = .{ .paint = solidPaint(1.0, 1.0, 1.0, 0.2), .width = 0.8 },
+        };
+    }
+
+    // Center circle (16-segment polygon approximation)
+    var pb = PathBuf.init(alloc);
+    const cr = 8.5;
+    const ns = 16;
+    for (0..ns) |i| {
+        const a = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(ns)) * 2.0 * std.math.pi;
+        const x = cx + cr * @cos(a);
+        const y = cy + cr * @sin(a);
+        if (i == 0) pb.moveTo(x, y) else pb.lineTo(x, y);
+    }
+    pb.close();
+    cmds[n_petals] = .{
+        .path = pb.path(),
+        .fill = .{ .paint = solidPaint(1.0, 0.88, 0.28, 1.0) },
+    };
+
+    const elem = try alloc.create(zcw.CustomElementData);
+    elem.* = .{ .vector_graphic = .{ .width = 100, .height = 100, .commands = cmds } };
+    return elem;
+}
+
+fn vecPanel(
+    id: []const u8,
+    label: []const u8,
+    elem: ?*zcw.CustomElementData,
+    font_id: u16,
+) void {
+    clay.UI()(.{
+        .id = clay.ElementId.ID(id),
+        .layout = .{
+            .direction = .top_to_bottom,
+            .sizing = .{ .w = .grow },
+            .child_gap = 8,
+            .child_alignment = .{ .x = .center },
+        },
+        .background_color = surface,
+        .corner_radius = .all(10),
+        .border = .{ .color = border, .width = .outside(1) },
+    })({
+        clay.UI()(.{
+            .id = clay.ElementId.localID("Canvas"),
+            .layout = .{ .sizing = .{ .w = .grow, .h = .fixed(160) } },
+            .background_color = .{ 12, 14, 26, 255 },
+            .corner_radius = .{ .top_left = 10, .top_right = 10 },
+            .custom = .{ .custom_data = if (elem) |e| @ptrCast(e) else null },
+        })({});
+        clay.UI()(.{
+            .id = clay.ElementId.localID("Label"),
+            .layout = .{ .sizing = .{ .w = .grow, .h = .fixed(32) }, .child_alignment = .{ .x = .center, .y = .center } },
+        })({
+            clay.text(label, .{ .font_id = font_id, .font_size = 12, .color = text_muted });
+        });
+    });
+}
+
+fn vectorContent(state: *State, font_id: u16, alloc: std.mem.Allocator) void {
+    const star = buildStar(alloc, state.vec_time) catch null;
+    const liss = buildLissajous(alloc, state.vec_time) catch null;
+    const flower = buildFlower(alloc, state.vec_time) catch null;
+
+    clay.UI()(.{
+        .id = .ID("VecCard"),
+        .layout = .{
+            .direction = .top_to_bottom,
+            .sizing = .{ .w = .grow },
+            .padding = .all(16),
+            .child_gap = 14,
+        },
+        .background_color = card,
+        .corner_radius = .all(10),
+        .border = .{ .color = border, .width = .outside(1) },
+    })({
+        clay.text("Vector graphics rendered via zvec path builder + GPU tessellation", .{
+            .font_id = font_id,
+            .font_size = 12,
+            .color = text_muted,
+        });
+
+        clay.UI()(.{
+            .id = .ID("VecRow"),
+            .layout = .{ .sizing = .{ .w = .grow }, .child_gap = 12 },
+        })({
+            vecPanel("StarPanel", "Morphing Star", star, font_id);
+            vecPanel("LissPanel", "Lissajous Curve", liss, font_id);
+            vecPanel("FlowerPanel", "Blooming Flower", flower, font_id);
+        });
+    });
+}
+
 // ── Root layout ───────────────────────────────────────────────────────────────
-fn createLayout(state: *State, font_id: u16, profile_image_id: u32, clicked: bool) void {
+fn createLayout(state: *State, font_id: u16, profile_image_id: u32, clicked: bool, vec_alloc: std.mem.Allocator) void {
     clay.UI()(.{
         .id = .ID("Root"),
         .layout = .{ .direction = .top_to_bottom, .sizing = .grow },
@@ -725,6 +977,7 @@ fn createLayout(state: *State, font_id: u16, profile_image_id: u32, clicked: boo
                 navItem("Users", .users, state, font_id, clicked);
                 navItem("Settings", .settings, state, font_id, clicked);
                 navItem("Profiling", .profiling, state, font_id, clicked);
+                navItem("Vector", .vector, state, font_id, clicked);
 
                 clay.UI()(.{ .id = .ID("SidebarGrow"), .layout = .{ .sizing = .{ .h = .grow } } })({});
                 clay.text("F1 - debug overlay", .{ .font_id = font_id, .font_size = 10, .color = text_muted });
@@ -735,7 +988,7 @@ fn createLayout(state: *State, font_id: u16, profile_image_id: u32, clicked: boo
                 .id = .ID("Main"),
                 .layout = .{ .direction = .top_to_bottom, .sizing = .grow, .padding = .all(20), .child_gap = 16 },
             })({
-                const tab_titles = [_][]const u8{ "Overview", "Analytics", "Users", "Settings", "Profiling" };
+                const tab_titles = [_][]const u8{ "Overview", "Analytics", "Users", "Settings", "Profiling", "Vector Graphics" };
                 clay.text(tab_titles[@intFromEnum(state.tab)], .{ .font_id = font_id, .font_size = 20, .color = text });
 
                 clay.UI()(.{
@@ -753,6 +1006,7 @@ fn createLayout(state: *State, font_id: u16, profile_image_id: u32, clicked: boo
                             .users => usersContent(font_id, profile_image_id),
                             .settings => settingsContent(state, font_id, clicked),
                             .profiling => profilingContent(state, font_id),
+                            .vector => vectorContent(state, font_id, vec_alloc),
                         }
                     });
                 });
@@ -811,6 +1065,10 @@ pub fn main(init: std.process.Init) !void {
 
     r.setUiScale(1.8);
 
+    // Arena for per-frame vector graphic path data; reset each frame before layout.
+    var vec_arena = std.heap.ArenaAllocator.init(counting_alloc.allocator());
+    defer vec_arena.deinit();
+
     while (!w.shouldClose()) {
         if (w.keyPressed(.equal)) r.setUiScale(r.font_atlas.ui_scale + 0.1);
         if (w.keyPressed(.minus)) r.setUiScale(r.font_atlas.ui_scale - 0.1);
@@ -829,12 +1087,18 @@ pub fn main(init: std.process.Init) !void {
         }
         prev_f1 = f1_now;
 
+        // Advance animation time using previous frame's measured duration.
+        state.vec_time += if (state.frame_time_ms > 0) state.frame_time_ms / 1000.0 else 1.0 / 60.0;
+
+        // Free previous frame's vector path allocations, then build fresh ones below.
+        _ = vec_arena.reset(.retain_capacity);
+
         const back_buffer = r.beginFrame();
 
         // ── Layout (timed for the profiling page) ─────────────────────────
         const layout_start = std.Io.Clock.awake.now(io);
         if (r.ui_fits) {
-            createLayout(&state, font_id, profile_image_id, clicked);
+            createLayout(&state, font_id, profile_image_id, clicked, vec_arena.allocator());
         } else {
             overflowLayout(font_id);
         }
