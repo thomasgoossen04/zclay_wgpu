@@ -52,7 +52,9 @@ pub fn build(
                 b.ensureMode(.geom);
                 const rd = cmd.render_data.rectangle;
                 const col = clayColor(rd.background_color);
-                if (rd.corner_radius.top_left > 0) {
+                const cr = rd.corner_radius;
+                const rounded = cr.top_left > 0 or cr.bottom_left > 0 or cr.top_right > 0 or cr.bottom_right > 0;
+                if (rounded) {
                     b.roundedRect(bb.x, bb.y, bb.width, bb.height, rd.corner_radius.top_left, col);
                 } else {
                     b.rect(bb.x, bb.y, bb.width, bb.height, col);
