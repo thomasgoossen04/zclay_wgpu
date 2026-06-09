@@ -86,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     
     while (!window.shouldClose()) {
         window.beginFrame(io);
-        const back_buffer = renderer.beginFrame();
+        renderer.beginFrame();
 
         clay.UI()(.{
             .id = .ID("Root"),
@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
             });
         });
 
-        renderer.endFrame(back_buffer);
+        renderer.endFrame();
         window.endFrame(io);
     }
 }

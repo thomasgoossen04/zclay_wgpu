@@ -1093,7 +1093,7 @@ pub fn main(init: std.process.Init) !void {
         // Free previous frame's vector path allocations, then build fresh ones below.
         _ = vec_arena.reset(.retain_capacity);
 
-        const back_buffer = r.beginFrame();
+        r.beginFrame();
 
         // ── Layout (timed for the profiling page) ─────────────────────────
         const layout_start = std.Io.Clock.awake.now(io);
@@ -1104,7 +1104,7 @@ pub fn main(init: std.process.Init) !void {
         }
         state.layout_time_ms = @as(f32, @floatFromInt(layout_start.untilNow(io, .awake).toNanoseconds())) / 1_000_000.0;
 
-        r.endFrame(back_buffer);
+        r.endFrame();
 
         // ── Frame timing — measured after render, before the fps sleep ────
         const frame_ns = frame_start.untilNow(io, .awake).toNanoseconds();

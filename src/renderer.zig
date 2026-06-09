@@ -315,7 +315,7 @@ pub const Renderer = struct {
         return self.image_atlas.addImage(png_data);
     }
 
-    pub fn beginFrame(self: *Renderer) wgpu.TextureView {
+    pub fn beginFrame(self: *Renderer) void {
         _ = self.font_atlas.updateDpiScale(self.glfw_window.getContentScale()[0]);
 
         const win = self.glfw_window.getSize();
@@ -348,24 +348,27 @@ pub const Renderer = struct {
         }, dt);
 
         clay.beginLayout();
-        return self.gctx.swapchain.getCurrentTextureView();
     }
 
-    pub fn endFrame(self: *Renderer, back_buffer: wgpu.TextureView) void {
+    pub fn endFrame(self: *Renderer) void {
         const cmds = clay.endLayout();
-
-        // If the framebuffer was just resized, back_buffer is already at the new size
-        // but swapchain_descriptor still holds the old size. The MSAA resolve would see
-        // a size mismatch and produce garbage. Skip this frame so present() can catch up.
-        const raw_fb = self.glfw_window.getFramebufferSize();
         const gctx = self.gctx;
-        if (@as(u32, @intCast(raw_fb[0])) != gctx.swapchain_descriptor.width or
-            @as(u32, @intCast(raw_fb[1])) != gctx.swapchain_descriptor.height)
-        {
-            back_buffer.release();
-            _ = gctx.present();
-            return;
+
+        // Proactively resize the swapchain before acquiring the texture view so that
+        // every frame renders at the current window size instead of going black.
+        const raw_fb = self.glfw_window.getFramebufferSize();
+        if (raw_fb[0] != 0 and raw_fb[1] != 0) {
+            const new_w: u32 = @intCast(raw_fb[0]);
+            const new_h: u32 = @intCast(raw_fb[1]);
+            if (new_w != gctx.swapchain_descriptor.width or new_h != gctx.swapchain_descriptor.height) {
+                gctx.swapchain_descriptor.width = new_w;
+                gctx.swapchain_descriptor.height = new_h;
+                gctx.swapchain.release();
+                gctx.swapchain = gctx.device.createSwapChain(gctx.surface, gctx.swapchain_descriptor);
+            }
         }
+
+        const back_buffer = gctx.swapchain.getCurrentTextureView();
 
         const fb_w = gctx.swapchain_descriptor.width;
         const fb_h = gctx.swapchain_descriptor.height;
