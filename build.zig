@@ -7,12 +7,12 @@ const std = @import("std");
 pub fn addTo(compile_step: *std.Build.Step.Compile) void {
     const b = compile_step.step.owner;
     const dep = b.dependencyFromBuildZig(@This(), .{
-        .target = compile_step.root_module.resolved_target orelse b.host,
+        .target = compile_step.root_module.resolved_target orelse b.graph.host,
         .optimize = compile_step.root_module.optimize orelse .Debug,
     });
     compile_step.root_module.addImport("zclay_wgpu", dep.module("zclay_wgpu"));
     const zgpu_dep = dep.builder.dependency("zgpu", .{
-        .target = compile_step.root_module.resolved_target orelse dep.builder.host,
+        .target = compile_step.root_module.resolved_target orelse dep.builder.graph.host,
         .optimize = compile_step.root_module.optimize orelse .Debug,
     });
     compile_step.root_module.linkLibrary(zgpu_dep.artifact("zdawn"));
